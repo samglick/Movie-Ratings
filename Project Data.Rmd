@@ -1,0 +1,89 @@
+---
+title: "STA 141C Project"
+author: "Alexander Lin"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(vroom)
+library(dplyr)
+library(tidyr)
+```
+
+```{r}
+#Importing data from github raw files
+
+options(timeout = max(500, getOption("timeout")))
+downloadLinks <- c("https://github.com/samglick/Movie-Ratings/raw/main/title.ratings.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/name.basics.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/title.principals.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/title.crew.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/title.basics.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/title.akas.tsv.gz?download=")
+names <- c("title.ratings", "name.basics", "title.principals", "title.crew", "title.basics", "title.akas")
+
+for (i in seq_along(downloadLinks)) {
+  filename <- names[i]
+  
+  download.file(downloadLinks[i], destfile = filename, mode = "wb", quiet = TRUE)
+  
+  assign(names[i], suppressMessages(vroom(filename, show_col_types = FALSE)))
+}
+```
+
+```{r}
+#Cleaning Individual Datasets
+
+c.title.basics <- title.basics %>%
+  filter(isAdult == 0, titleType == "movie" | titleType == "tvMovie", runtimeMinutes >= 60, startYear >= 1940) %>%
+  select(tconst, primaryTitle, startYear, genres)
+rm(title.basics)
+
+c.title.principals <- title.principals %>%
+  select(tconst, nconst, category, job) %>%
+  group_by(nconst)
+rm(title.principals)
+
+c.title.ratings <- title.ratings %>% filter(numVotes >= 100)
+rm(title.ratings)
+
+c.name.basics <- name.basics %>%
+  filter(deathYear == '\\N' | deathYear >= 1940) %>%
+  select(nconst, primaryName, primaryProfession, knownForTitles)
+rm(name.basics)
+
+c.title.crew <- title.crew
+rm(title.crew)
+
+c.title.akas <- title.akas %>%
+  select(titleId, title, region, language, attributes, isOriginalTitle)
+rm(title.akas)
+```
+
+```{r}
+#Master Datasets
+
+mainMovie <- inner_join(c.title.basics, c.title.ratings, by = "tconst") %>%
+                inner_join(c.title.crew, by = "tconst")
+
+mainPeople <- inner_join(select(mainMovie, tconst, startYear, genres, averageRating), c.title.principals, by = "tconst")
+mainPeople <- mainPeople %>% select(nconst, category, job, tconst, startYear, genres, averageRating) %>%
+                filter(tconst %in% mainMovie$tconst) %>% arrange(nconst)
+
+average_ratings <- mainPeople %>% group_by(nconst) %>% summarize(allAveRatings = mean(averageRating, na.rm = TRUE))
+unique_roles <- mainPeople %>% group_by(nconst) %>% summarize(roles = toString(unique(category)))
+numWorks <- mainPeople %>% group_by(nconst) %>% summarize(work_count = n())
+
+mainAveRatings <- inner_join(unique_roles, average_ratings, by = "nconst") %>% inner_join(numWorks, by = "nconst")
+rm(average_ratings, unique_roles, numWorks)
+
+mainRatingRole <- mainPeople %>% group_by(nconst, category) %>%
+  summarize(allAveRatings = mean(averageRating, na.rm = TRUE), count = n())
+
+head(mainMovie)
+head(mainPeople)
+head(mainAveRatings)
+head(mainRatingRole)
+```
