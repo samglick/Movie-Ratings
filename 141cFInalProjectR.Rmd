@@ -1,0 +1,244 @@
+---
+title: "141cFinalProject"
+author: "Samuel J Glick, Alec S Lin, Vincent A Barletta"
+date: "2024-02-25"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r Unzipping}
+unzip("moviesZip.zip")
+```
+```{r Reading Tsv's}
+library(data.table)
+title <- fread("title.basics.tsv")
+name <- fread("name.basics.tsv")
+principals <- fread("title.principals.tsv")
+ratings <- fread("title.ratings.tsv")
+```
+```{r}
+dim(title)
+dim(name)
+dim(princ)
+dim(rate)
+```
+Pre Sorting Initial Data: 
+
+```{r Efficient RDS Datafile Storage}
+saveRDS(title, "title.rds")
+saveRDS(name, "name.rds")
+saveRDS(principals, "principals.rds")
+saveRDS(ratings, "ratings.rds")
+```
+# Data Descritions
+Rating is about the ratings of each film I think there 
+Titles is about the information on the title, such as genre and other things originally 10,000,000 Initially
+Principals is about who worked on each title and is our longest data frame by far. 60,000,000 Initially
+Name is about the actor and their information
+
+#10:12-10:20 8 Minutes How long will it take to load like 100 million rows into r
+8 minutes
+```{r Unpacking the files without having to load them each time}
+title<-readRDS("title.rds")
+name<-readRDS("name.rds")
+princ<-readRDS("principals.rds")
+rate<-readRDS("ratings.rds")
+```
+Initials:
+title: 10.5 mil by 9
+name: 13.2 mil by 6
+princ: 60.7 mil by 6
+rate: 1.39 mil by 3
+Whole Data Set: 750 Thousand
+
+#Filtering Ideas
+All cleaning items will limit the total number of titles we are appending to the name information data frame
+
+Only titles with at least 100 votes
+Only titles that are tvMovie or movie
+Only non adult titles
+Only titles that are at least sixty minutes long
+
+
+Sorted Rating: went from 1.39 mil to 350 thousand 75 percent decrease
+```{r Filtering the Rate Data Frame}
+#Filtering Rate
+head(rate)
+rate <- rate[rate$numVotes > 100]
+hist(rate$averageRating)
+
+#Filtering Title
+names(title)
+unique(title$titleType)
+title<-title[title$titleType=="movie" | title$titleType=="tvMovie"]
+title<-title[title$isAdult==0]
+title<-title[title$runtimeMinutes>60]
+
+#Creating Movie Data by Merging, can we optimize merging the data, probably should drop columns and 
+namePrinc<-merge(princ,name, by = "nconst")
+rateTitle<-merge(title,rate, by = "tconst")
+movieData<-merge(namePrinc,rateTitle, by="tconst")
+saveRDS(movieData,"movieData.rds")
+```
+Filtered title went from 10.5 million to 276782 thousand
+
+
+Really long chunk. 
+
+
+In our sorted data set we have 79 thousand titles, and it is a dimension of 765370 by 19 with each actor their role, in each movie that they played in. 
+
+79 Thousand Titles
+328 Thousand Different Names
+
+Saving the large data set into our rds. format so we can quickly access it. 
+```{r Reading in all movieData }
+movieData<-readRDS("movieData.rds")
+```
+
+Histograms, Initial Plots, No Prediction Here.
+```{r Exploratory Data Analysis}
+unqTit<-length(unique(movieData$tconst))
+unqTit
+unqAct<-length(unique(movieData$nconst))
+unqAct
+
+library(dplyr)
+actPerMov <- data %>%
+  group_by(tconst) %>%
+  summarise(UniqueActors = n_distinct(nconst))
+summary(actPerMov$UniqueActors)
+hist(actPerMov$UniqueActors)
+plot(data$numVotes,data$averageRating)
+numAvg<-lm(data$averageRating~data$numVotes)
+summary(numAvg)
+abline(numAvg)
+```
+Initial linear combination model, lets see how long it takes to run, we are predicting for 79 thousand different titles, and we have to predict each actor in that movie's average rating for all their prior work for that title. We do not want to use future leakage when predicting current event, so therefore, would using a time series make more sense? This large very time staking block of code is testing out the intial linear combination (Averages) model to predict all of the movies in our data set. This could be considered LOOCV for the entire data set with our null model being.
+
+Basic Average
+Moving Average
+Exponential Smoothing (Type of Average)
+Regression Models with Time Decay Factors
+Actor's Career Trajectory Analysis (Time Series Method)
+Mixed Effects Models (combining the actors abilities with the titles that they were in
+Network Analysis)
+# Clustering (A List, B List, Rising Stars, use that instead of each individual actor to predict the ratings)
+
+The most basic historical data linear combination method
+```{r}
+library(data.table)
+library(ggplot2)
+
+# Ensure movieData is a data.table and correct data types
+setDT(movieData)
+movieData[, startYear := as.numeric(startYear)]
+
+# Prepare a copy for self-joining
+data_copy <- copy(movieData)
+
+# Compute historical average ratings (self-join) - This step seems conceptualized incorrectly
+# First, ensure historical data is correctly aggregated:
+actor_hist_avg <- movieData[, .(avgRating = mean(averageRating, na.rm = TRUE)), by = .(nconst, startYear)]
+
+# Now, perform operations intended for predicting ratings based on historical data
+# Ensure only past performances are used for each actor's rating prediction
+movieData[, historicalAvgRating := actor_hist_avg[movieData, on = .(nconst, startYear < startYear), mean(avgRating), by = .EACHI]$V1]
+
+# Correcting the approach to sample and predict:
+set.seed(123)  # Setting seed for reproducibility
+sample_titles <- movieData[sample(.N, 200), tconst]  # Sample titles
+
+# Filter the main dataset to only include these titles
+data_sample <- movieData[tconst %in% sample_titles]
+
+# Predict each movie's rating in the sample based on historical data (revised correctly)
+data_sample[, predictedRating := actor_hist_avg[data_sample, on = .(nconst, startYear <= startYear), mean(avgRating, na.rm = TRUE), by = .EACHI]$V1]
+
+# Merge for comparison
+# Since data_sample already contains the movies, no need for additional merge here
+
+# Aggregate to movie level to compare actual vs predicted
+actual_vs_predicted <- data_sample[, .(actualRating = mean(averageRating, na.rm = TRUE), 
+                                       predictedRating = mean(predictedRating, na.rm = TRUE)), by = tconst]
+
+# Plotting
+ggplot(actual_vs_predicted, aes(x = actualRating, y = predictedRating)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  labs(title = "Actual vs Predicted Movie Ratings (Sample)",
+       x = "Actual Average Rating",
+       y = "Predicted Average Rating") +
+  theme_minimal()
+
+
+
+```
+
+New classification method to make our data more suitable for regression. New Variables are prop rising, prop nobody, prop a, prop c, per title basis. Lets try an initial regression next using our new features. 
+
+```{r Packages}
+install.packages("foreach")
+install.packages("doParellel")
+```
+
+```{r  Turn The Data Into A, B, C, Nobodys, Rising Stars, Data Should }
+library(data.table)
+library(foreach)
+library(doParallel)s
+
+create_actor_proportions_parallel <- function(movieData) {
+    setDT(movieData)
+    movieData[, startYear := as.numeric(startYear)]
+    
+    # Register parallel backend to use multiple cores
+    cl <- makeCluster(detectCores() - 1)  # Leave one core free
+    registerDoParallel(cl)
+    
+    # Prepare historical data: Aggregate by actor and year in parallel
+    actorHistory <- foreach(n = unique(movieData$nconst), .combine = rbind, .packages = 'data.table') %dopar% {
+        tempData <- movieData[nconst == n]
+        tempData[, .(AverageRating = mean(averageRating), TotalMovies = .N, LatestYear = max(startYear)), by = .(nconst)]
+    }
+    
+    # Define thresholds for categories
+    thresholds <- list('A-List' = list('minRating' = 7, 'minMovies' = 10),
+                       'B-List' = list('minRating' = 5, 'minMovies' = 5),
+                       'Rising Star' = list('minRating' = 7, 'minMovies' = 3),
+                       'C-List' = list('minRating' = 4, 'minMovies' = 2),
+                       'Nobody' = list('minRating' = 0, 'minMovies' = 0))
+    
+    # Assign categories based on historical data
+    actorHistory[, Category := 
+                 fifelse(TotalMovies >= thresholds[['A-List']]$minMovies & AverageRating >= thresholds[['A-List']]$minRating, 'A-List',
+                 fifelse(TotalMovies >= thresholds[['B-List']]$minMovies & AverageRating >= thresholds[['B-List']]$minRating, 'B-List',
+                 fifelse(TotalMovies >= thresholds[['Rising Star']]$minMovies & AverageRating >= thresholds[['Rising Star']]$minRating & (LatestYear == max(movieData$startYear)), 'Rising Star',
+                 fifelse(TotalMovies >= thresholds[['C-List']]$minMovies & AverageRating >= thresholds[['C-List']]$minRating, 'C-List',
+                 'Nobody'))))]
+
+    # Merge categories back to the original data
+    movieData <- merge(movieData, actorHistory[, .(nconst, Category)], by = "nconst", all.x = TRUE)
+    
+    # Calculate proportions of each category in each movie
+    proportions <- movieData[, .(Count = .N), by = .(tconst, Category)]
+    proportions[, Proportion := Count / sum(Count), by = tconst]
+    
+    # Spread the proportions into separate columns for each category
+    proportionColumns <- dcast(proportions, tconst ~ Category, value.var = "Proportion", fill = 0)
+    
+    # Merge the proportions back into the original movie data
+    movieData <- merge(movieData, proportionColumns, by = "tconst", all.x = TRUE)
+    
+    # Stop the parallel cluster after completion
+    stopCluster(cl)
+    
+    # Return the updated movie data with proportions
+    return(movieData)
+}
+
+# Apply the parallel function to your dataset
+updatedMovieData <- create_actor_proportions_parallel(movieData)
+
+```
