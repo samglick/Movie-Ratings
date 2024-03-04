@@ -37,8 +37,8 @@ for (i in seq_along(downloadLinks)) {
 #Cleaning Individual Datasets
 
 c.title.basics <- title.basics %>%
-  filter(isAdult == 0, titleType == "movie" | titleType == "tvMovie", runtimeMinutes >= 60, startYear >= 1940) %>%
-  select(tconst, primaryTitle, startYear, genres)
+  filter(isAdult == 0, titleType == "movie", runtimeMinutes >= 60, startYear >= 1940) %>%
+  select(tconst, primaryTitle, startYear, genres, runtimeMinutes)
 rm(title.basics)
 
 c.title.principals <- title.principals %>%
@@ -68,6 +68,9 @@ rm(title.akas)
 mainMovie <- inner_join(c.title.basics, c.title.ratings, by = "tconst") %>%
                 inner_join(c.title.crew, by = "tconst")
 
+mainByMovie <- inner_join(select(mainMovie, tconst, averageRating, numVotes, runtimeMinutes), select(c.title.principals, tconst, nconst, category),
+                          by = "tconst")
+
 mainPeople <- inner_join(select(mainMovie, tconst, startYear, genres, averageRating), c.title.principals, by = "tconst")
 mainPeople <- mainPeople %>% select(nconst, category, job, tconst, startYear, genres, averageRating) %>%
                 filter(tconst %in% mainMovie$tconst) %>% arrange(nconst)
@@ -83,6 +86,7 @@ mainRatingRole <- mainPeople %>% group_by(nconst, category) %>%
   summarize(allAveRatings = mean(averageRating, na.rm = TRUE), count = n())
 
 head(mainMovie)
+head(mainByMovie)
 head(mainPeople)
 head(mainAveRatings)
 head(mainRatingRole)
