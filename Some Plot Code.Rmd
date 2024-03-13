@@ -1,0 +1,445 @@
+---
+title: "Model Plots"
+output: pdf_document
+date: "2024-03-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Loading the Dataset}
+model_dataset<-readRDS("C:/Users/Alec/Documents/Sta 141C/model_dataset.rds") #Use your path
+```
+
+
+Linear Regression
+```{r}
+library(ggplot2)
+
+formula <- TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg +
+  SupportingActressAvg + directorRtg + writerRtg + producerRtg +
+  cinematographerRtg + composerRtg
+
+basicLR <- lm(formula, model_dataset)
+
+aov(basicLR)
+
+anova(basicLR)
+
+library(car)
+vif(basicLR)
+
+summary(basicLR)
+
+fitted.values <- fitted(basicLR)
+
+# Calculate AIC
+aic <- AIC(basicLR)
+cat("AIC:", aic, "\n")
+
+# Calculate MSE
+mse <- mean(residuals(basicLR)^2)
+cat("MSE:", mse, "\n")
+
+# Calculate R-squared
+r_squared <- summary(basicLR)$r.squared
+cat("R-squared:", r_squared, "\n")
+
+# Create a data frame with actual and fitted values
+plot_data <- data.frame(Actual = model_dataset$TrueIMDBScore, Fitted = fitted.values)
+
+# Create the plot using ggplot2
+ggplot(plot_data, aes(x = Actual, y = Fitted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Actual TrueIMBDScore", y = "Fitted TrueIMBDScore",
+       title = "Actual vs Fitted TrueIMBDScore  - Linear Model")
+```
+
+
+
+
+### Polynomial Regression Modeling
+```{r}
+library(caret)
+library(ggplot2)
+
+# Assuming your dataset is named 'model_dataset'
+polyz <- model_dataset
+polyz <- na.omit(polyz)
+
+# Create polynomial terms for each predictor variable
+polyz$LeadActorRtg.poly <- poly(polyz$LeadActorRtg, degree = 3)
+polyz$LeadActressRtg.poly <- poly(polyz$LeadActressRtg, degree = 3)
+polyz$SupportingActorAvg.poly <- poly(polyz$SupportingActorAvg, degree = 3)
+polyz$SupportingActressAvg.poly <- poly(polyz$SupportingActressAvg, degree = 3)
+polyz$directorRtg.poly <- poly(polyz$directorRtg, degree = 3)
+polyz$writerRtg.poly <- poly(polyz$writerRtg, degree = 3)
+polyz$producerRtg.poly <- poly(polyz$producerRtg, degree = 3)
+polyz$composerRtg.poly <- poly(polyz$composerRtg, degree = 3)
+
+# Define the polynomial regression formula
+polyformula <- TrueIMDBScore ~ LeadActorRtg.poly + LeadActressRtg.poly + SupportingActorAvg.poly + SupportingActressAvg.poly + directorRtg.poly + writerRtg.poly + producerRtg.poly + composerRtg.poly
+
+# Set up cross-validation
+train_control <- trainControl(method = "cv", number = 10)
+
+# Perform polynomial regression with cross-validation
+cv_model <- train(polyformula, data = polyz, method = "lm", trControl = train_control)
+
+# Print the cross-validation results
+print(cv_model)
+
+# Make predictions using the cross-validated model
+predicted_values <- predict(cv_model, newdata = polyz)
+
+# Calculate evaluation metrics
+mse <- mean((polyz$TrueIMDBScore - predicted_values)^2)
+cat("Cross-validated MSE:", mse, "\n")
+
+rsquared <- cor(polyz$TrueIMDBScore, predicted_values)^2
+cat("Cross-validated R-squared:", rsquared, "\n")
+
+# Calculate AIC for the cross-validated model
+aic <- AIC(cv_model$finalModel)
+cat("AIC:", aic, "\n")
+
+# Create a data frame with actual and predicted values
+plot_data <- data.frame(Actual = polyz$TrueIMDBScore, Predicted = predicted_values)
+
+# Create the plot using ggplot
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Actual TrueIMDBScore", y = "Predicted TrueIMDBScore",
+       title = "Predicted vs Actual TrueIMDBScore - Lasso Regression")
+
+```
+
+
+### LASSO Modeling
+```{r Lasso Regression}
+# Load necessary libraries
+library(glmnet)
+library(caret)
+library(ggplot2)
+
+# Prepare the data for modeling
+x <- as.matrix(model_dataset[, setdiff(names(model_dataset), "TrueIMDBScore")])
+y <- model_dataset$TrueIMDBScore
+
+# Set seed for reproducibility
+set.seed(123)
+
+cv_lasso <- cv.glmnet(x, y, alpha=1, type.measure="mse", nfolds=10) # You can adjust 'nfolds' for cross-validation folds
+
+# Plot the cross-validation result to visualize performance vs lambda values
+plot(cv_lasso)
+
+# Best lambda value
+best_lambda <- cv_lasso$lambda.min
+cat("Best lambda for Lasso:", best_lambda, "\n")
+
+# Fit the Lasso model on the full data using the best lambda
+lasso_model <- glmnet(x, y, alpha=1, lambda=best_lambda)
+
+# Coefficients of the model
+print(coef(lasso_model))
+
+# Predict using the Lasso model
+predictions <- predict(lasso_model, newx=x)
+
+# Evaluate the model performance
+mse <- mean((y - predictions)^2)
+rsquared <- 1 - sum((y - predictions)^2) / sum((y - mean(y))^2)
+cat("MSE:", mse, "\n")
+cat("R-Squared:", rsquared, "\n")
+
+# Approximate AIC
+n <- length(y)
+df <- sum(coef(lasso_model) != 0)
+deviance <- sum((y - predictions)^2)
+aic_approx <- n * log(deviance/n) + 2 * df
+cat("Approximate AIC:", aic_approx, "\n")
+
+# Plot Predicted vs Actual values
+actual_vs_predicted <- data.frame(Actual = y, Predicted = as.vector(predictions))
+ggplot(actual_vs_predicted, aes(x=Actual, y=Predicted)) +
+  geom_point() +
+  geom_line(aes(x=Actual, y=Actual), color="red") +
+  ggtitle("Predicted vs Actual TrueIMDBScore - Lasso Regression") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+```
+
+
+Ridge Regression
+```{r}
+library(glmnet)
+library(ggplot2)
+
+formula <- TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg +
+  SupportingActressAvg + directorRtg + writerRtg + producerRtg +
+  cinematographerRtg + composerRtg
+
+x <- model.matrix(formula, data = model_dataset)[, -1] # Remove intercept column
+y <- model_dataset$TrueIMDBScore
+
+# Perform ridge regression with cross-validation to select the best lambda value
+cv_ridge <- cv.glmnet(x, y, alpha = 0, nfolds = 10)
+best_lambda <- cv_ridge$lambda.min
+
+# Fit the final ridge regression model with the best lambda value
+ridge_model <- glmnet(x, y, alpha = 0, lambda = best_lambda)
+
+# Make predictions on the original dataset
+predictions <- predict(ridge_model, newx = x)
+
+# Calculate evaluation metrics
+mse <- mean((y - predictions)^2)
+cat("Mean Squared Error (MSE):", mse, "\n")
+
+r_squared <- 1 - sum((y - predictions)^2) / sum((y - mean(y))^2)
+cat("R-squared:", r_squared, "\n")
+
+# Approximate AIC
+n <- length(y)
+df <- ridge_model$df
+deviance <- sum((y - predictions)^2)
+aic_approx <- n * log(deviance/n) + 2 * df
+cat("Approximate AIC:", aic_approx, "\n")
+
+# Create a data frame with actual and predicted values
+plot_data <- data.frame(Actual = y, Predicted = as.vector(predictions))
+
+# Create the plot using ggplot2
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Actual TrueIMDBScore", y = "Predicted TrueIMDBScore",
+       title = "Actual vs Predicted TrueIMDBScore - Ridge Regression")
+```
+
+Elastic (Takes a Long Time)
+```{r}
+library(glmnet)
+library(caret)
+library(ggplot2)
+
+# Assuming your dataset is named 'model_dataset'
+elastic_data <- model_dataset
+elastic_data <- na.omit(elastic_data)
+
+# Create the predictor matrix and response vector
+x <- model.matrix(TrueIMDBScore ~ ., data = elastic_data)[, -1]
+y <- elastic_data$TrueIMDBScore
+
+# Set up cross-validation
+train_control <- trainControl(method = "cv", number = 10)
+
+# Perform elastic net regression with cross-validation
+cv_model <- train(x, y, method = "glmnet", trControl = train_control,
+                  tuneLength = 10, preProc = c("center", "scale"))
+
+# Print the cross-validation results
+print(cv_model)
+
+# Access the best model
+best_model <- cv_model$finalModel
+
+# Make predictions using the best model
+predicted_values <- predict(best_model, newx = x, s = cv_model$bestTune$lambda)
+
+# Calculate evaluation metrics
+mse <- mean((y - predicted_values)^2)
+cat("Cross-validated MSE:", mse, "\n")
+
+rsquared <- cor(y, predicted_values)^2
+cat("Cross-validated R-squared:", rsquared, "\n")
+
+# Calculate AIC for the best model
+aic <- AIC(best_model, x = x, y = y)
+cat("AIC:", aic, "\n")
+
+# Create a data frame with actual and predicted values
+plot_data <- data.frame(Actual = y, Predicted = predicted_values)
+
+# Create the plot using ggplot
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Actual TrueIMDBScore", y = "Predicted TrueIMDBScore",
+       title = "Predicted vs Actual TrueIMDBScore - Lasso Regression")
+
+```
+
+
+Bagging 
+```{r}
+library(caret)
+library(ggplot2)
+
+# Assuming model_dataset is your dataset and TrueIMDBScore is your target variable
+
+# Prepare the data (this might already be done)
+x <- model_dataset[, setdiff(names(model_dataset), "TrueIMDBScore")] # Predictor variables
+y <- model_dataset$TrueIMDBScore # Target variable
+
+# Set up cross-validation
+train_control <- trainControl(method = "cv",
+                              number = 10,
+                              verboseIter = TRUE,
+                              returnResamp = "all")
+
+formula <- TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg +
+  SupportingActressAvg + directorRtg + writerRtg + producerRtg + composerRtg
+
+# Training model
+bagging_fit <- train(formula, data = model_dataset, method = "treebag", trControl = train_control)
+
+print(bagging_fit)
+
+cv_results_bagging <- bagging_fit$results
+
+# Mean and standard deviation of RMSE
+mean_RMSE_bagging <- mean(cv_results_bagging$RMSE)
+std_RMSE_bagging <- sd(cv_results_bagging$RMSE)
+cat("Mean RMSE (Bagging):", mean_RMSE_bagging, "\n")
+cat("Standard deviation of RMSE (Bagging):", std_RMSE_bagging, "\n")
+
+# Calculate AIC
+aic <- bagging_fit$finalModel$aic
+cat("Akaike Information Criterion (AIC):", aic, "\n")
+
+# Calculate MSE
+predicted_values <- predict(bagging_fit, newdata = model_dataset)
+mse <- mean((y - predicted_values)^2)
+cat("Mean Squared Error (MSE):", mse, "\n")
+
+# Calculate R-squared
+sst <- sum((y - mean(y))^2)
+ssr <- sum((predicted_values - y)^2)
+r_squared <- 1 - (ssr / sst)
+cat("R-squared:", r_squared, "\n")
+
+# Combine actual scores and predictions into a new dataframe for plotting
+plot_data <- data.frame(Actual = y, Predicted = predicted_values)
+
+# Plot predicted vs actual values
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_line(aes(x = Actual, y = Actual), color = "red") +
+  ggtitle("Predicted vs Actual TrueIMDBScore - Bagging") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+```
+
+2 different Boosting code
+
+1)
+Mean Squared Error (MSE): 0.2203681 
+R-squared: 0.7977264 
+```{r}
+# Load necessary libraries
+library(caret)
+library(ggplot2)
+
+# Assuming model_dataset is your dataset and TrueIMDBScore is your target variable
+
+# Prepare the data (this might already be done)
+x <- model_dataset[, setdiff(names(model_dataset), "TrueIMDBScore")] # Predictor variables
+y <- model_dataset$TrueIMDBScore # Target variable
+
+# Set up cross-validation
+train_control <- trainControl(method = "cv",
+                              number = 10,
+                              verboseIter = TRUE,
+                              returnResamp = "all")
+
+formula <- TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg +
+  SupportingActressAvg + directorRtg + writerRtg + producerRtg + composerRtg
+
+# Training model
+boosting_fit <- train(formula, data = model_dataset, method = "xgbTree", trControl = train_control)
+
+print(boosting_fit)
+
+cv_results_boosting <- boosting_fit$results
+
+# Mean and standard deviation of RMSE
+mean_RMSE_boosting <- mean(cv_results_boosting$RMSE)
+std_RMSE_boosting <- sd(cv_results_boosting$RMSE)
+cat("Mean RMSE (Boosting):", mean_RMSE_boosting, "\n")
+cat("Standard deviation of RMSE (Boosting):", std_RMSE_boosting, "\n")
+
+# Calculate AIC
+aic <- boosting_fit$finalModel$aic
+cat("Akaike Information Criterion (AIC):", aic, "\n")
+
+# Calculate MSE
+predicted_values <- predict(boosting_fit, newdata = model_dataset)
+mse <- mean((y - predicted_values)^2)
+cat("Mean Squared Error (MSE):", mse, "\n")
+
+# Calculate R-squared
+sst <- sum((y - mean(y))^2)
+ssr <- sum((predicted_values - y)^2)
+r_squared <- 1 - (ssr / sst)
+cat("R-squared:", r_squared, "\n")
+
+# Combine actual scores and predictions into a new dataframe for plotting
+plot_data <- data.frame(Actual = y, Predicted = predicted_values)
+
+# Plot predicted vs actual values
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_line(aes(x = Actual, y = Actual), color = "red") +
+  ggtitle("Predicted vs Actual TrueIMDBScore - Boosting") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+```
+
+
+2) Boost
+MSE: 0.2640261 
+R squared: 0.7576844 
+
+```{r}
+# Load required libraries
+library(caret)
+library(ggplot2)
+
+# Define the boosting method (e.g., gradient boosting)
+boost_method <- trainControl(method = "cv", number = 10)
+
+# Define the formula
+formula <- TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg +
+  SupportingActressAvg + directorRtg + writerRtg + producerRtg + composerRtg
+
+# Train the boosting model with cross-validation
+boost_model <- train(formula, data = model_dataset, method = "gbm", trControl = boost_method)
+
+# Predict on the training set
+predictions <- predict(boost_model, model_dataset)
+
+# Calculate MSE and R squared
+mse <- mean((model_dataset$TrueIMDBScore - predictions)^2)
+rsquared <- cor(model_dataset$TrueIMDBScore, predictions)^2
+
+# Print MSE and R squared
+cat("MSE:", mse, "\n")
+cat("R squared:", rsquared, "\n")
+
+# Create a data frame for plotting
+plot_data <- data.frame(Actual = model_dataset$TrueIMDBScore, Predicted = predictions)
+
+# Plot predicted vs actual values
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Actual TrueIMDBScore", y = "Predicted TrueIMDBScore", title = "Predicted vs Actual TrueIMDBScore - Boosting")
+
+
+```
