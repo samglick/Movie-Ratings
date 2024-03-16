@@ -1,0 +1,979 @@
+<<<<<<< HEAD
+---
+title: "IMDB Rating Predictor"
+author: "Alexander Lin, Vincent Barletta, Samuel Glick"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(vroom)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(car)
+library(leaps)
+library(caret)
+library(glmnet)
+library(plotly)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+library(randomForest)
+library(keras)
+```
+
+## Part 1: Dataset Formulation
+
+First, we begin with importing our data from the raw TSV (tab-seperated values) datasets from our GitHub. We load directly from our directory, so it takes a bit of time to process all of our data. Using the vroom package, we translate all of our data into a tibble for initial simplicity.
+
+The second for loop will go through our list of download links and assign their corresponding table names.
+
+```{r}
+#Importing data from github raw files
+#Takes a little bit of time depending on your computer
+
+options(timeout = max(500, getOption("timeout")))
+downloadLinks <- c("https://github.com/samglick/Movie-Ratings/raw/main/title.ratings.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/name.basics.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/title.principals.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/title.crew.tsv.gz?download=",
+                   "https://github.com/samglick/Movie-Ratings/raw/main/title.basics.tsv.gz?download=")
+names <- c("title.ratings", "name.basics", "title.principals", "title.crew", "title.basics")
+
+for (i in seq_along(downloadLinks)) {
+  filename <- names[i]
+  
+  download.file(downloadLinks[i], destfile = filename, mode = "wb", quiet = TRUE)
+  
+  assign(names[i], suppressMessages(vroom(filename, show_col_types = FALSE)))
+}
+```
+
+After loading our data, some datasets have problems that we must resolve, often causing the datasets to take very long to load. We can simply remove the rows that have problems from our title.basics and title.principals datasets.
+
+```{r}
+problem_t_basics = problems(title.basics)
+problem_t_principals = problems(title.principals)
+title.basics = title.basics[-problem_t_basics$row, ]
+title.principals = title.principals[-problem_t_principals$row, ]
+
+```
+
+Now, we can begin to trim our datasets based on some specific criteria we chose for our project.
+
+First, we want to focus only on movies, so we eliminate all other forms (tv, short films, etc.). We want to eliminate rows that do not have a recorded runTime or startYear, and we do not want Adult films.
+
+Next, we filter for movies that are longer than 60 minutes and less than 300 minutes and select movies made after 1940. We use 1940 as a cutoff point for modern cinema. We chose this criteria as many movies before this time were silent, black-and-white, or did not follow modern cinema conventions.
+
+Our other primary criteria is we narrowed our movie dataset down to movies with more than 100 votes, as we do not want to include niche movies with high ratings but very low votes that might skew our distribution. Given that our initial datasets are massive as well, we needed a way to vet down our dataset into a useable format.
+
+```{r}
+#Cleaning Individual Datasets
+
+# Title Basics
+c.title.basics <- title.basics %>%
+  filter(as.integer(isAdult) == 0, runtimeMinutes != "\\N", titleType == "movie", startYear != "\\N") %>%
+  select(tconst, primaryTitle, startYear, genres, runtimeMinutes)
+
+c.title.basics <- c.title.basics %>% select(tconst, primaryTitle, startYear, runtimeMinutes, genres) %>%
+  filter(as.integer(runtimeMinutes) > 60 & as.integer(runtimeMinutes) < 300, startYear >= 1940) %>%
+  mutate(
+    runtimeMinutes = as.integer(runtimeMinutes),
+    startYear = as.integer(startYear)
+  ) %>%
+  arrange(startYear)
+
+rm(title.basics)
+
+#Title Principals
+c.title.principals <- title.principals %>%
+  select(tconst, nconst, category, job) %>%
+  group_by(nconst)
+
+#Title Ratings
+c.title.ratings <- title.ratings %>% filter(as.integer(numVotes) >= 100)
+rm(title.ratings)
+
+#Name Basics
+suppressWarnings(c.name.basics <- name.basics %>%
+  filter(deathYear == '\\N' | as.integer(deathYear) >= 1940) %>%
+  select(nconst, primaryName, primaryProfession, knownForTitles, birthYear) %>% arrange(birthYear))
+rm(name.basics)
+
+#Because we coerced some NAs, we need to check where they may have came up
+#Many people do not have a primaryProfession logged, which is okay.
+#However, we want to get rid of data that does not have a primaryName
+na_indices <- which(is.na(c.name.basics), arr.ind = TRUE)
+length(na_indices)
+na_counts <- table(na_indices[, 2])
+c.name.basics = c.name.basics %>% filter(!(is.na(primaryName)))
+na_indices <- which(is.na(c.name.basics), arr.ind = TRUE)
+na_counts <- table(na_indices[, 2])
+
+c.title.crew <- title.crew
+rm(title.crew)
+rm(title.principals)
+```
+
+
+```{r}
+#Master Datasets
+
+mainMovie <- inner_join(c.title.basics, c.title.ratings, by = "tconst") %>%
+                inner_join(c.title.crew, by = "tconst")
+
+mainByMovie <- inner_join(select(mainMovie, tconst, primaryTitle, averageRating, numVotes, runtimeMinutes),
+                          select(c.title.principals, tconst, nconst, category), by = "tconst")
+
+mainPeople <- inner_join(select(mainMovie, tconst, primaryTitle, startYear, genres, averageRating), c.title.principals, by = "tconst")
+
+mainPeople <- mainPeople %>% select(nconst, category, job, tconst, primaryTitle, startYear, genres, averageRating) %>%
+                filter(tconst %in% mainMovie$tconst) %>% arrange(nconst)
+
+average_ratings <- mainPeople %>% group_by(nconst) %>% summarize(allAveRatings = mean(averageRating, na.rm = TRUE))
+unique_roles <- mainPeople %>% group_by(nconst) %>% summarize(roles = toString(unique(category)))
+numWorks <- mainPeople %>% group_by(nconst) %>% summarize(work_count = n())
+
+mainAveRatings <- inner_join(unique_roles, average_ratings, by = "nconst") %>% inner_join(numWorks, by = "nconst")
+rm(average_ratings, unique_roles, numWorks)
+
+mainRatingRole <- mainPeople %>% group_by(nconst, category) %>%
+  summarize(allAveRatings = mean(averageRating, na.rm = TRUE), count = n())
+
+head(mainMovie)
+head(mainByMovie)
+head(mainPeople)
+head(mainAveRatings)
+head(mainRatingRole)
+```
+
+```{r}
+edaMovie <- mainMovie %>% filter(numVotes >= 25000)
+
+edaPeople = inner_join(select(edaMovie, tconst, primaryTitle, startYear, genres, averageRating), c.title.principals, by = "tconst")
+edaPeople <- edaPeople %>% select(nconst, category, job, tconst, primaryTitle, startYear, genres, averageRating) %>%
+                filter(tconst %in% mainMovie$tconst) %>% arrange(nconst)
+
+edaRatingRole <- edaPeople  %>% group_by(nconst, category) %>% filter(startYear >= 1940) %>%
+  summarize(allAveRatings = mean(averageRating, na.rm = TRUE), count = n())
+
+
+df_filtered <- edaRatingRole %>%
+  group_by(nconst) %>%
+  filter(count == max(count)) %>%
+  ungroup()
+
+df_reducedcount <- df_filtered %>% filter(count >= 10) %>% select(-count) 
+
+idandname = c.name.basics %>% select(nconst, primaryName)
+
+actornames <- left_join(df_reducedcount, idandname, by = "nconst") 
+
+topactors <- actornames %>% filter(category == "actor") %>% arrange(desc(allAveRatings))
+topdirectors <- actornames %>% filter(category == "director") %>% arrange(desc(allAveRatings))
+topwriters <- actornames %>% filter(category == "writer") %>% arrange(desc(allAveRatings))
+topwriters = na.omit(topwriters)
+topactress <- actornames %>% filter(category == "actress") %>% arrange(desc(allAveRatings))
+topcinematographer <- actornames %>% filter(category == "cinematographer") %>% arrange(desc(allAveRatings))
+topcomposer <- actornames %>% filter(category == "composer") %>% arrange(desc(allAveRatings))
+topproducer <- actornames %>% filter(category == "producer") %>% arrange(desc(allAveRatings))
+```
+
+
+```{r}
+rm(c.name.basics)
+rm(c.title.basics)
+rm(c.title.crew)
+rm(c.title.principals)
+rm(c.title.ratings)
+```
+
+
+```{r}
+#Each role as a column
+moviePivotTable <- mainByMovie %>%
+  pivot_wider(names_from = category, values_from = nconst, values_fn = list(nconst = toString))
+```
+
+```{r}
+reducedMoviePivotTable = moviePivotTable %>% select(-c(self,editor,production_designer,archive_footage,archive_sound))
+```
+
+I've considered a couple of options. We can either select the top writer, producer, director, etc. for each movie.
+Or, we can consider an average of all of the people involved in the role and take it as the overall score for the staff for that movie.
+
+For writers, composers, directors, producers, cinematographers, I believe that this is the correct choice.
+However, for actors and actresses, I believe that we should dilineate between Lead Roles and Supporting Cast (all other billed actors and actresses). This is influenced not only by award show formats, but also because of the billing on box office features. 
+
+Thus, we will have LeadActor and LeadActress as variables as well as SupportingActors and SupportingActresses as an average of all outside of the leading roles. 
+
+Below, we will begin our calculations to calculate the average ratings of all of the support staff. This verbiage might be a bit confusing as we have utilized the term average rating quite frequently thus far, so I will elaborate further. 
+For all of the writers on a movie, we take the average of all of their associated IMDb scores.
+
+```{r}
+intermediaryTable <- left_join(mainByMovie, mainRatingRole, by = c("nconst", "category"))
+
+#worksAve is the average rating of their works by category
+intermediaryTable <- intermediaryTable %>%
+  rename(worksAve = allAveRatings)
+
+```
+
+We will now filter this table for only the categories we desire to average. I opted for a brute force method as it was not working normally. Once we select only the roles that we want to use, we can group by movie and role, summarize to get the average rating for all of the people in one category (e.g. get the AvgWriterRtg by averaging all of the writer's ratings), and pivot the table horizontally to include all of the Ratings columns. 
+
+```{r}
+filteredTable <- intermediaryTable %>% filter(category == 'director' | category == 'writer' | category =='cinematographer'| category =='composer'| category =='producer')
+
+AvgRoleRatings <- filteredTable %>%
+  group_by(tconst, category) %>%
+  summarise(avg_role_rating = mean(worksAve, na.rm = TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = category, values_from = avg_role_rating)
+
+
+names(AvgRoleRatings) <- c('tconst','directorRtg','writerRtg','producerRtg','cinematographerRtg','composerRtg')
+#Renames each column to include Rtg at the end of the variable name
+
+```
+
+Next, we will work on getting the associated Actor and Actress values. For the LeadActor and LeadActress roles,
+it is difficult to discern which actor or actress is the main character in the film just based on the category listing.
+
+```{r}
+actorsTable <- intermediaryTable %>% filter(category == 'actor' | category == 'actress')
+```
+
+From anecdotal data analysis, the order of the actor and actress on the above table denotes the billing of the actor. The ActorID's (nconst) that appear first for each movie are the leading actors and actresses, while the lower ones on the list are the supporting cast. Even if a lower actor has a higher average than a higher one, they are considered in a supporting role (at least for that movie).
+
+In this code, we group by Movie and Category to delineate the actors and actresses for each movie. We then assign a rank based on their row_number() as the Lead Actor/Lead Actress appear first. We then pivot our table outwards based on their role. 
+
+This table is incomplete, though, as it lists ActorRtgs and ActressRtgs on different rows for the same tconst. To achieve our final table, we have to group by tconst, mutate across our table, omit NAs, and keep only the distinct tconst (to get rid of the duplicate rows).
+```{r}
+
+lead_actors <- actorsTable %>%
+  group_by(tconst, category) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank == 1) %>%
+  pivot_wider(
+    names_from = category,
+    values_from = worksAve,
+    names_prefix = "Lead"
+  ) %>%
+  rename(LeadActorRtg = `Leadactor`, LeadActressRtg = `Leadactress`) %>%
+  select(tconst, LeadActorRtg, LeadActressRtg)
+
+lead_actors_final <- lead_actors %>% group_by(tconst) %>%
+  mutate(across(c(LeadActorRtg, LeadActressRtg), ~na.omit(.)[1])) %>%
+  distinct(tconst, .keep_all = TRUE)
+    
+```
+
+Now that we have extracted the Ratings for the LeadActors, we can filter out all Actors/Actresses where rank=1 (Lead).
+From there, we repeat the same operation we did to average the Directors, Producers, etc. by pivoting and averaging across all actor/actress ratings to create a SupportingActorRtg/SupportingActressRtg.
+
+```{r}
+noLeads <- actorsTable %>% group_by(tconst, category) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank > 1) %>%
+  ungroup()
+
+supportingRtgs <- noLeads %>%
+  group_by(tconst, category) %>%
+  summarise(avg_role_rating = mean(worksAve, na.rm = TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = category, values_from = avg_role_rating)
+
+names(supportingRtgs) <- c('tconst','SupportingActorAvg','SupportingActressAvg')
+
+```
+
+Finally, we have all of our Rtg datasets for the cast and crew. We can then join all of them to our primary movie table. It is VERY important that we do a left join rather than an inner join as we want to attach all data to our original table. If we opted for an inner join, it would reduce the size of our larger table. 
+
+```{r}
+final_dataset <- reducedMoviePivotTable %>%
+  left_join(lead_actors_final, by = "tconst") %>%
+  left_join(supportingRtgs, by = "tconst") %>%
+  left_join(AvgRoleRatings, by = "tconst")
+```
+
+We can now remove the nconst columns as we have attached their associated scores.
+
+```{r}
+model_dataset <- final_dataset %>% rename(MovieID = tconst, TrueIMDBScore = averageRating, MovieTitle = primaryTitle) 
+model_dataset <- model_dataset %>% dplyr::select(-writer, -actress, -actor, -director, -producer, -composer, -cinematographer)
+```
+
+## Part 2: Exploratory Data Analysis and Initial Model Building
+
+Our primary goal is to figure out how much of an impact each role has on an IMDb rating, and figuring out what variables are the best predictor of a movies success. Before we begin creating different prediction models, we can do some exploratory data analysis to explore some interesting heuristics and statistics about our dataset. 
+
+Our final modeling dataset has 14 columns and 116,575 rows -- each corresponding to a movie from 1940 to 2024. (unreleased movies with).
+
+### I am going to add more EDA here showing the top actors, directors, etc. Unfortunately we did not keep any of the names in our intermediary datasets, so I will have to reload our original data later. I don't want to do it right now since it might crash my RStudio.
+
+#```{r}
+#actor_dataset = final_dataset %>% dplyr::select(actor, LeadActorRtg) %>% arrange(desc(LeadActorRtg))
+#actor_dataset %>% dplyr::select(actor)
+#```
+
+
+```{r}
+nrow(model_dataset)
+ncol(model_dataset)
+```
+
+```{r}
+summary(model_dataset)
+```
+
+```{r}
+model_dataset %>% filter(numVotes == 2861216)
+```
+
+The summary provides some illimunating insights about our data. The film with the largest amounts of votes, 2,861,216,
+is The Shawshank Redemption, the number one movie on the IMDB's Top 250 movie results. This movie has a TrueIMDBRating of 9.3, placing it at the top of IMDb's movie catalog. However, there are movies with higher ratings than 9.3 that are not displayed in the IMDb Top 250!
+
+```{r}
+model_dataset %>% filter(TrueIMDBScore > 9.3)
+```
+
+Another very important observation from our numVotes column is the distribution. Our Median vote amount is 496, while our Mean vote amount is 9333. This is a massive discrepancy from the top of our distribution to the bottom. The mean is even much larger than the third quartile! For the movies ranked higher than The Shawshank Redemption in the table above, none of them exceed the mean number of votes, with many even lower than the median. 
+
+For this project, we are primarily focused around predicting success around mainstream, blockbuster cinema. These films that few have watched are largely outliers to the general movie goer. Thus, we will further restrict our range to a more reasonable value of movies with more than 5000 votes. This will reduce our dataset to a respectable 16,274 movies -- more than enough for our prediction methods.
+
+```{r}
+model_dataset = model_dataset %>% filter(numVotes >= 5000)
+nrow(model_dataset)
+```
+
+```{r}
+model_dataset %>% arrange(desc(TrueIMDBScore))
+```
+
+If we observe our top movie list, we still see some foreign films with much lower vote counts than our typical Top 250 films. Our next method of mitigation for outliers with drastically less votes is to introduce weights for our model based on vote count. We will create a new column for our dataset called weight, which will be the number of votes of a movie divided by the mean number of votes for the overall dataset.
+
+```{r}
+summary(model_dataset$numVotes)
+```
+
+After increasing our threshold to 5000 Votes, we see that the Median, Mean, and 3rd Quartile drastically increased. Our Mean is still larger than our 3rd Quartile, but we can adjust this with our scaling.
+
+```{r}
+model_dataset$weight <- model_dataset$numVotes / mean(model_dataset$numVotes)
+model_dataset %>% arrange(desc(TrueIMDBScore * weight))
+
+testset = model_dataset
+scaled_IMDBScore <- scale(testset$TrueIMDBScore)
+scaled_Votes <- scale(testset$numVotes)
+
+IMDBScore_weight <- 0.875  # Adjust according to preference
+Votes_weight <- 0.125  # Adjust according to preference
+
+# Calculate weighted sum of scaled features
+weighted_sum <- IMDBScore_weight * scaled_IMDBScore + Votes_weight * scaled_Votes
+
+# Rank the movies based on the weighted sum
+testset$weight <- weighted_sum
+ranked_set = testset %>% arrange(desc(weight))
+head(ranked_set, n=10)
+```
+
+This ranked set should provide us with a better indication of highly regarded and popular movies. I experimented quite extensively with finding an understandable tuning combination for the weights, and while some popular movies are rated higher than expected, it reduces the interference of outliers.
+
+### Part 3: Linear Models -- What roles are most important to a film?
+
+Now, we can look at what roles on a cast are most important to predicting a high IMDb score. We will first begin with a basic linear model and ANOVA. Then, we will do a train/test split, and then cross validation amongst our samples.
+
+In my initial testing, I thought it was necessary to set all of the NA values to 0 so that they do not have bearing on the model. This is not correct practice as it totally skewed the distribution graphs.
+
+
+```{r}
+selected_columns <- seq(7,14)
+
+row_means <- rowMeans(model_dataset[, selected_columns], na.rm = TRUE)
+
+model_dataset[, selected_columns] <- lapply(model_dataset[, selected_columns], function(x) ifelse(is.na(x), row_means, x))
+
+model_dataset = na.omit(model_dataset)
+```
+
+Save model_dataset as an rds file. Upload it to github so that we do not have to load, and clean every time. Will also speed up model testing, and knitting later on.  
+```{r Save as RDS}
+saveRDS(model_dataset,"model_dataset.rds")
+```
+
+Load model_dataset.rds from github. Should be in the same repository as 141C_VB3.Rmd and will make things more convenient.
+```{r Loading the Dataset}
+model_dataset<-readRDS("model_dataset.rds")
+```
+
+
+```{r}
+formula <- TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg +
+  SupportingActressAvg + directorRtg + writerRtg + producerRtg +
+  cinematographerRtg + composerRtg
+
+basicLR <- lm(formula, model_dataset)
+
+aov(basicLR)
+
+anova(basicLR)
+
+vif(basicLR)
+
+summary(basicLR)
+
+fitted.values <- fitted(basicLR)
+
+# Calculate AIC
+aic <- AIC(basicLR)
+cat("AIC:", aic, "\n")
+
+# Calculate MSE
+mse <- mean(residuals(basicLR)^2)
+cat("MSE:", mse, "\n")
+
+# Calculate R-squared
+r_squared <- summary(basicLR)$r.squared
+cat("R-squared:", r_squared, "\n")
+
+# Create a data frame with actual and fitted values
+plot_data <- data.frame(Actual = model_dataset$TrueIMDBScore, Fitted = fitted.values)
+
+# Create the plot using ggplot2
+ggplot(plot_data, aes(x = Actual, y = Fitted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Actual TrueIMBDScore", y = "Fitted TrueIMBDScore",
+       title = "Actual vs Fitted TrueIMBDScore  - Linear Model")
+```
+
+```{r}
+summary(basicLR)
+coef(basicLR)
+plot(basicLR)
+```
+
+```{r}
+plot(TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg + SupportingActressAvg + directorRtg + writerRtg +producerRtg + cinematographerRtg + composerRtg, data=model_dataset)
+abline(basicLR, col="red")
+```
+
+If we use stepwise selection to analyze what variables are insignificant to our model, we can see that CinematographerRTG can be dropped from our model based on the AIC values for the attempted models. Our initial model has an AIC value of -12039.87, and after dropping cinematographer, we receive an AIC of -12041.67. It is a very small difference, but is important to note regardless. 
+
+```{r}
+model2<-lm(formula, data=basicLR$model)
+step_model = step(model2)
+summary(step_model)
+step_model$anova
+```
+
+We can cross-check this analysis by running another regression subset tool to decide which variables are most important to our model.
+
+```{r, include=FALSE}
+Best_Subset <- regsubsets(formula,
+               data =model_dataset,
+               nbest = 1,      # 1 best model for each number of predictors
+               nvmax = NULL,    # NULL for no limit on number of variables
+               force.in = NULL, force.out = NULL,
+               method = "exhaustive")
+
+summary_best_subset <- summary(Best_Subset)
+summary(Best_Subset)
+as.data.frame(summary_best_subset$outmat)
+which.max(summary_best_subset$adjr2)
+summary_best_subset$which[8,]
+
+```
+
+Through exhaustive search, the subset tool tells us that 8 parameters is best for our model, upon which we see that it confirms to drop cinematographerRtg. Additionally interesting is how it ranks the importance of variables.
+
+From Best to Worst, it denotes: Writer, SupportingActress, Director, Producer, SupportingActor, LeadActress, LeadActor, Composer, and lastly Cinematographer.
+
+A potentially important consideration is that many early movies did not have a SupportActress, so it cannot bear a negative correlation on a film.
+
+Now, we will use cross-validation to get a more accurate representation of predictive power. We will work with the general rule of thumb of using k=10 fold cross validation. We will drop Cinematographer from our rating as per the stepwise selection's recommendation.
+
+```{r, include=FALSE}
+suppressWarnings(library(caret))
+```
+
+IMPORTANT: A very key distinction between this model and our previous linear model is that it will reject NA values. Therefore, we choose to have them omitted. In other modeling packages, like RandomForests, we can impute these missing values with mean/median. In this case, however, we simply omit them.
+
+```{r}
+set.seed(123)
+formula = (TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg + SupportingActressAvg + directorRtg + writerRtg + producerRtg  + composerRtg)
+
+model_dataframe = data.frame(model_dataset)
+
+# Set up the train control for 10-fold cross-validation
+train_control <- trainControl(method = "cv", number = 10)
+
+# Fit the linear model with cross-validation
+lm_fit <- train(formula, data = model_dataframe, method = "lm", trControl = train_control, na.action = na.omit)
+
+# Print the cross-validation results
+print(lm_fit)
+
+# Extract the cross-validation statistics
+cv_results <- lm_fit$results
+
+# Calculate the training and test errors
+train_error <- mean(cv_results$RMSE^2)  # Mean squared error on the training sets
+test_error <- mean(cv_results$Rsquared)  # R-squared on the test sets (higher is better)
+
+# Print the training and test errors
+cat("Training error (MSE):", train_error, "\n")
+cat("Test error (R-squared):", test_error, "\n")
+```
+
+Anecdotally, this R^2 is slightly higher than our previous model that utilized CinematographerRTG -- therefore, we should continue forward without CinematographerRtg. 
+
+### Polynomial Regression Modeling
+
+An important consideration is to test and see if certain polynomial terms may fit our data better, given the shape of our data. We will try stepwise selection as well as the previous regression subset tool.
+
+Since our model cannot utilize any NA values, we will impute the average on all missing values.
+
+```{r}
+polyz <- model_dataset
+polyz <- na.omit(polyz)
+
+# Polynomial terms for each predictor variable
+polyz$LeadActorRtg.poly <- poly(polyz$LeadActorRtg, degree = 3)
+polyz$LeadActressRtg.poly <- poly(polyz$LeadActressRtg, degree = 3)
+polyz$SupportingActorAvg.poly <- poly(polyz$SupportingActorAvg, degree = 3)
+polyz$SupportingActressAvg.poly <- poly(polyz$SupportingActressAvg, degree = 3)
+polyz$directorRtg.poly <- poly(polyz$directorRtg, degree = 3)
+polyz$writerRtg.poly <- poly(polyz$writerRtg, degree = 3)
+polyz$producerRtg.poly <- poly(polyz$producerRtg, degree = 3)
+polyz$composerRtg.poly <- poly(polyz$composerRtg, degree = 3)
+
+# Polynomial regression formula
+polyformula <- TrueIMDBScore ~ LeadActorRtg.poly + LeadActressRtg.poly + SupportingActorAvg.poly + SupportingActressAvg.poly + directorRtg.poly + writerRtg.poly + producerRtg.poly + composerRtg.poly
+
+train_control <- trainControl(method = "cv", number = 10)
+cv_model <- train(polyformula, data = polyz, method = "lm", trControl = train_control)
+
+print(cv_model)
+predicted_values <- predict(cv_model, newdata = polyz)
+
+mse <- mean((polyz$TrueIMDBScore - predicted_values)^2)
+cat("Cross-validated MSE:", mse, "\n")
+
+rsquared <- cor(polyz$TrueIMDBScore, predicted_values)^2
+cat("Cross-validated R-squared:", rsquared, "\n")
+
+aic <- AIC(cv_model$finalModel)
+cat("AIC:", aic, "\n")
+
+
+plot_data <- data.frame(Actual = polyz$TrueIMDBScore, Predicted = predicted_values)
+
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Actual TrueIMDBScore", y = "Predicted TrueIMDBScore",
+       title = "Predicted vs Actual TrueIMDBScore - Lasso Regression")
+```
+
+```{r, include=FALSE}
+Best_Subset <- regsubsets(polyformula,
+               data =polyz,
+               nbest = 1,      # 1 best model for each number of predictors
+               nvmax = NULL,    # NULL for no limit on number of variables
+               force.in = NULL, force.out = NULL,
+               method = "exhaustive")
+
+summary_best_subset <- summary(Best_Subset)
+summary(Best_Subset)
+as.data.frame(summary_best_subset$outmat)
+which.max(summary_best_subset$adjr2)
+summary_best_subset$which[23,]
+
+```
+
+This tells us to keep 23 of our predictors, only dropping the cubed term of producerRtg. 
+
+When we consider of the polynomial compared to our linear model, the polynomial model is lower. However, it is not by a very significant measure. Given that we typically want to select a simpler model, and this model relies on 23 predictors rather than our initial 8, we would still prefer to use our original linear model.
+
+Then, we will move into more advanced modeling with Lasso and Ridge Regression where we will use cross validation to choose our hypertuning parameter.
+
+### Ridge Regression Modeling
+
+```{r}
+formula <- TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg +
+  SupportingActressAvg + directorRtg + writerRtg + producerRtg +
+  cinematographerRtg + composerRtg
+
+x <- model.matrix(formula, data = model_dataset)[, -1] # Remove intercept column
+y <- model_dataset$TrueIMDBScore
+
+# Perform ridge regression with cross-validation to select the best lambda value
+cv_ridge <- cv.glmnet(x, y, alpha = 0, nfolds = 10)
+best_lambda <- cv_ridge$lambda.min
+
+# Fit the final ridge regression model with the best lambda value
+ridge_model <- glmnet(x, y, alpha = 0, lambda = best_lambda)
+
+# Make predictions on the original dataset
+predictions <- predict(ridge_model, newx = x)
+
+# Calculate evaluation metrics
+mse <- mean((y - predictions)^2)
+cat("Mean Squared Error (MSE):", mse, "\n")
+
+r_squared <- 1 - sum((y - predictions)^2) / sum((y - mean(y))^2)
+cat("R-squared:", r_squared, "\n")
+
+# Approximate AIC
+n <- length(y)
+df <- ridge_model$df
+deviance <- sum((y - predictions)^2)
+aic_approx <- n * log(deviance/n) + 2 * df
+cat("Approximate AIC:", aic_approx, "\n")
+
+# Create a data frame with actual and predicted values
+plot_data <- data.frame(Actual = y, Predicted = as.vector(predictions))
+
+# Create the plot using ggplot2
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Actual TrueIMDBScore", y = "Predicted TrueIMDBScore",
+       title = "Actual vs Predicted TrueIMDBScore - Ridge Regression")
+```
+
+
+
+
+### LASSO Modeling
+Lasso used the L One norm, to reduce the dimensions of the dataset, by making beta parameters zero if th
+```{r Lasso Regression}
+# Prepare the data for modeling
+x <- as.matrix(model_dataset[, setdiff(names(model_dataset), "TrueIMDBScore")])
+y <- model_dataset$TrueIMDBScore
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Suppress warnings during cross-validation
+cv_lasso <- suppressWarnings(cv.glmnet(x, y, alpha=1, type.measure="mse", nfolds=10))
+
+# Plot the cross-validation result to visualize performance vs lambda values
+plot(cv_lasso)
+
+# Best lambda value
+best_lambda <- cv_lasso$lambda.min
+cat("Best lambda for Lasso:", best_lambda, "\n")
+
+# Fit the Lasso model on the full data using the best lambda
+lasso_model <- glmnet(x, y, alpha=1, lambda=best_lambda)
+
+# Coefficients of the model
+print(coef(lasso_model))
+
+# Predict using the Lasso model
+predictions <- predict(lasso_model, newx=x)
+
+# Evaluate the model performance
+mse <- mean((y - predictions)^2)
+rsquared <- 1 - sum((y - predictions)^2) / sum((y - mean(y))^2)
+cat("MSE:", mse, "\n")
+cat("R-Squared:", rsquared, "\n")
+
+# Approximate AIC
+n <- length(y)
+df <- sum(coef(lasso_model) != 0)
+deviance <- sum((y - predictions)^2)
+aic_approx <- n * log(deviance/n) + 2 * df
+cat("Approximate AIC:", aic_approx, "\n")
+
+# Plot Predicted vs Actual values
+actual_vs_predicted <- data.frame(Actual = y, Predicted = as.vector(predictions))
+ggplot(actual_vs_predicted, aes(x=Actual, y=Predicted)) +
+  geom_point() +
+  geom_line(aes(x=Actual, y=Actual), color="red") +
+  ggtitle("Predicted vs Actual TrueIMDBScore - Lasso Regression") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+
+```
+
+
+Elastic Net Regression
+```{r Elastic Net Regression}
+x <- as.matrix(model_dataset[, setdiff(names(model_dataset), "TrueIMDBScore")])
+y <- model_dataset$TrueIMDBScore
+
+# Cross-validation settings
+set.seed(123) 
+cv_control <- trainControl(method="cv", number=10)  # Here you can adjust the number of folds
+
+# Train the model using Elastic Net regression
+# Note: The alpha parameter controls the mix of lasso and ridge regression:
+# alpha = 1 is lasso regression, alpha = 0 is ridge regression, and 0 < alpha < 1 is elastic net
+elastic_net_model <- suppressWarnings(train(x, y, method="glmnet",
+                           trControl=cv_control,
+                           tuneLength=100,  # Number of alpha/lambda pairs to try; increase for finer tuning
+                           preProcess=c("center", "scale")))  # Standardize for elastic net
+
+importance <- varImp(elastic_net_model, scale=FALSE)
+plot(importance, main="Variable Importance")
+
+# Extract best lambda and alpha
+best_lambda <- elastic_net_model$bestTune$lambda
+best_alpha <- elastic_net_model$bestTune$alpha
+cat("Best lambda:", best_lambda, "\n")
+cat("Best alpha:", best_alpha, "\n")
+
+# Predictions and model performance
+predicted_values <- predict(elastic_net_model, newdata=x)
+performance <- postResample(predicted_values, y)
+performance[1]
+performance[2]
+
+tuning_results<-elastic_net_model$results
+# Plot Predicted vs Actual values
+actual_vs_predicted <- data.frame(Actual = y, Predicted = predicted_values)
+ggplot(actual_vs_predicted, aes(x=Actual, y=Predicted)) +
+  geom_point() +
+  geom_line(aes(x=Actual, y=Actual), color="red") +
+  ggtitle("Predicted vs Actual TrueIMDBScore") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+
+# 'tuning_results' contains the tuning grid with corresponding R-squared values
+# Convert lambda to log scale
+tuning_results$log_lambda <- log(tuning_results$lambda)
+fig <- plot_ly(data = tuning_results, x = ~alpha, y = ~log(lambda), z = ~Rsquared, type = 'scatter3d', mode = 'markers',
+               marker = list(size = 5, opacity = 0.8)) %>%
+  layout(title = '3D Plot of Alpha, Log(Lambda) vs R-squared',
+         scene = list(xaxis = list(title = 'Alpha'),
+                      yaxis = list(title = 'Log(Lambda)'),
+                      zaxis = list(title = 'R-squared')))
+fig
+```
+#### Tree Based Methods (Decision Tree, Bagging, Boosting, Random Forrest)
+
+### Decision Tree - We can see the Regression Tree by how choppy the graph looks. Line segments represent where a partition was made in the data parameters, and one value was given to data within that partition. 
+```{r Decision Tree (Basic)}
+
+dt_model <- train(TrueIMDBScore~., data=model_dataset, method="rpart", trControl=control, tuneLength=10)
+
+
+# Generate predictions for the original dataset
+predicted_values <- predict(dt_model, newdata = model_dataset)
+
+# Combine actual scores and predictions into a new dataframe for plotting
+plot_data <- data.frame(Actual = model_dataset$TrueIMDBScore, Predicted = predicted_values)
+
+# Plot predicted vs actual values
+ggplot(plot_data, aes(x = Actual, y = Predicted)) + 
+  geom_point() +  # Actual vs Predicted data points
+  geom_line(aes(x = Actual, y = Actual), color = "red") +  # Add a 45-degree line for reference
+  ggtitle("Predicted vs Actual TrueIMDBScore - Decision Tree") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+
+pred<-plot_data$Predicted
+obs<-plot_data$Actual
+mse_dec <- mean((obs - pred)^2)
+rsquared_dec <- 1 - sum((obs - pred)^2) / sum((obs- mean(obs))^2)
+cat("MSE:", mse_dec, "\n")
+cat("R-Squared:", rsquared_dec, "\n")
+
+importance <- varImp(dt_model, scale = TRUE)
+
+# Plot variable importance
+plot(importance, main = "Variable Importance Plot for Decision Tree")
+
+best_model <- dt_model$finalModel
+
+# Plot the tree
+rpart.plot(best_model, type = 4, extra = 102, under = TRUE, faclen = 0)
+```
+
+### Bagging 
+
+```{r}
+x <- model_dataset[, setdiff(names(model_dataset), "TrueIMDBScore")] # Predictor variables
+y <- model_dataset$TrueIMDBScore # Target variable
+
+# Set up cross-validation
+train_control <- trainControl(method = "cv",
+                              number = 10,
+                              verboseIter = TRUE,
+                              returnResamp = "all")
+
+formula <- TrueIMDBScore ~ LeadActorRtg + LeadActressRtg + SupportingActorAvg +
+  SupportingActressAvg + directorRtg + writerRtg + producerRtg + composerRtg
+
+# Training model
+bagging_fit <- train(formula, data = model_dataset, method = "treebag", trControl = train_control)
+
+print(bagging_fit)
+
+cv_results_bagging <- bagging_fit$results
+
+# Mean and standard deviation of RMSE
+mean_RMSE_bagging <- mean(cv_results_bagging$RMSE)
+std_RMSE_bagging <- sd(cv_results_bagging$RMSE)
+cat("Mean RMSE (Bagging):", mean_RMSE_bagging, "\n")
+cat("Standard deviation of RMSE (Bagging):", std_RMSE_bagging, "\n")
+
+# Calculate AIC
+aic <- bagging_fit$finalModel$aic
+cat("Akaike Information Criterion (AIC):", aic, "\n")
+
+# Calculate MSE
+predicted_values <- predict(bagging_fit, newdata = model_dataset)
+mse <- mean((y - predicted_values)^2)
+cat("Mean Squared Error (MSE):", mse, "\n")
+
+# Calculate R-squared
+sst <- sum((y - mean(y))^2)
+ssr <- sum((predicted_values - y)^2)
+r_squared <- 1 - (ssr / sst)
+cat("R-squared:", r_squared, "\n")
+
+# Combine actual scores and predictions into a new dataframe for plotting
+plot_data <- data.frame(Actual = y, Predicted = predicted_values)
+
+# Plot predicted vs actual values
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_line(aes(x = Actual, y = Actual), color = "red") +
+  ggtitle("Predicted vs Actual TrueIMDBScore - Bagging") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+```
+
+Boosting
+```{r}
+#Need Sams Boosting code
+
+boosting_fit <- train(formula, data = model_dataset, method = "xgbTree", trControl = train_control)
+print(boosting_fit)
+cv_results_boosting <- boosting_fit$results
+
+# mean and standard deviation of RMSE
+mean_RMSE_boosting <- mean(cv_results_boosting$RMSE)
+std_RMSE_boosting <- sd(cv_results_boosting$RMSE)
+
+cat("Mean RMSE (Boosting):", mean_RMSE_boosting, "\n")
+cat("Standard deviation of RMSE (Boosting):", std_RMSE_boosting, "\n")
+
+plot(boosting_fit)
+
+predictions <- predict(boosting_fit, newdata = model_dataset)
+
+# Combine actual scores and predictions into a new dataframe for plotting
+plot_data <- data.frame(obs = model_dataset$TrueIMDBScore, pred = predictions)
+
+# Plot predictions vs actual values
+ggplot(plot_data, aes(x = obs, y = pred)) +
+  geom_point() + 
+  geom_line(aes(x = obs, y = obs), color = "red") +  # Add a 45-degree line for reference
+  ggtitle("Predicted vs Actual TrueIMDBScore Boosting") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+```
+
+### Random Forrest
+```{r Random Forrest}
+# Assuming 'model_dataset' is your data and 'TrueIMDBScore' is the target variable
+# Create a formula
+formula <- TrueIMDBScore ~ .
+
+# Set up cross-validation
+train_control <- trainControl(method = "cv", number = 10)  # 10-fold cross-validation
+
+# Set a seed for reproducibility
+set.seed(123)
+
+# Train the Random Forest model with cross-validation
+rf_model_cv <- train(formula, data = model_dataset, method = "rf",
+                     trControl = train_control,
+                     ntree = 75,
+                     importance = TRUE)
+
+# Summary of the model
+print(rf_model_cv)
+
+
+# Extract and plot predictions vs. actual values
+# Assuming rf_model is your trained Random Forest model
+# Generate predictions
+predictions <- predict(rf_model_cv, newdata = model_dataset)
+
+# Combine actual scores and predictions into a new dataframe for plotting
+plot_data <- data.frame(obs = model_dataset$TrueIMDBScore, pred = predictions)
+
+# Plot predictions vs actual values
+ggplot(plot_data, aes(x = obs, y = pred)) +
+  geom_point() + 
+  geom_line(aes(x = obs, y = obs), color = "red") +  # Add a 45-degree line for reference
+  ggtitle("Predicted vs Actual TrueIMDBScore For Random Forrest") +
+  xlab("Actual TrueIMDBScore") +
+  ylab("Predicted TrueIMDBScore")
+
+importance <- varImp(rf_model_cv, scale = TRUE)
+
+# Plot variable importance
+plot(importance, main = "Variable Importance Plot Random Forrest")
+```
+
+### Neural Network
+```{r Neural Network for Regression with Keras (Ran On Google Collab)}
+# Splitting the dataset into training (80%) and testing (20%)
+sample_size <- floor(0.8 * nrow(model_dataset))
+train_indices <- sample(seq_len(nrow(model_dataset)), size = sample_size)
+
+train_data <- model_dataset[train_indices, ]
+test_data <- model_dataset[-train_indices, ]
+
+# Separate predictors and response
+train_x <- as.matrix(train_data[, setdiff(names(train_data), "TrueIMDBScore")])
+test_x <- as.matrix(test_data[, setdiff(names(test_data), "TrueIMDBScore")])
+train_y <- train_data$TrueIMDBScore
+test_y <- test_data$TrueIMDBScore
+
+# Normalize data if necessary
+# Note: It's important to scale your data for neural networks, especially for regression problems.
+model <- keras_model_sequential() %>%
+  layer_dense(units = 10, activation = 'relu', input_shape = dim(train_x)[2]) %>%
+  layer_dense(units = 5, activation = 'relu') %>%
+  layer_dense(units = 1)  # Output layer for regression
+
+model %>% compile(
+  loss = 'mse',  # Mean Squared Error for regression
+  optimizer = optimizer_rmsprop(),
+  metrics = list('mean_absolute_error')
+)
+
+history <- model %>% fit(
+  train_x,
+  train_y,
+  epochs = 100,
+  batch_size = 32,
+  validation_split = 0.2
+)
+
+```
+
+
+### Comparisson of the Models (Lets make some tables or bar charts to show the success of different models)
+We Tried:
+Linear Regressions:
+- Basic Linear Regression
+- Polynomial Linear Regression
+- Elastic Linear Regression (A Combination of Lasso and Ridge)
+Tree Based Method:
+- Basic Decision Tree
+- Bagged Decision Trees
+- Boosted Decision Trees
+- Random Forrest Method For Regression
+Neural Network, Two Layer For Regression
